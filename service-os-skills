@@ -1,0 +1,268 @@
+#!/usr/bin/env python3
+"""Service OS skill bundle manager; Python standard library only."""
+import argparse
+import json
+import os
+from pathlib import Path
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+
+SOURCE = Path(__file__).resolve().parent
+USER = Path(os.environ.get('SERVICE_OS_USER_ROOT', str(Path.home()))).resolve()
+BASE = USER / '.local/share/service-os-skills'
+BUNDLE = BASE / 'bundle'
+STATE = BASE / 'state.json'
+REMOTE = 'https://github.com/ishwar260596/service-os-ai-skills.git'
+BEGIN = '<!-- service-os-skills:start -->'
+END = '<!-- service-os-skills:end -->'
+
+
+def run(*args, cwd=None):
+    return subprocess.check_output(args, cwd=cwd, text=True, stderr=subprocess.STDOUT).strip()
+
+
+def load(path, default):
+    return json.loads(path.read_text()) if path.exists() else default
+
+
+def save(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(path.name + '.service-os-tmp')
+    temp.write_text(json.dumps(value, indent=2) + '\n')
+    temp.replace(path)
+
+
+def routes():
+    return ('Whenever the user invokes /service-os, $service-os, Service OS, service-os, '
+            'or serviceos, you MUST read and apply the Service OS base skill at '
+            f'{BUNDLE / "skills/service-os/SKILL.md"} before responding. '
+            'For incident investigation require only FE ID and Job ID. '
+            'Check Firebase latest release and mobile Coralogix first. Request a debug log '
+            'only after dashboard checks are insufficient. For general questions do not require incident IDs.')
+
+
+def links():
+    return {USER / '.agents/skills/service-os': BUNDLE / 'skills/service-os',
+            USER / '.local/bin/service-os-skills': BUNDLE / 'service-os-skills'}
+
+
+def check_link(path, target):
+    if path.is_symlink():
+        if path.resolve() != target.resolve():
+            raise ValueError(f'Refusing unrelated symlink: {path}')
+    elif path.exists():
+        raise ValueError(f'Refusing existing file/directory: {path}')
+
+
+def link(path, target):
+    check_link(path, target)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.is_symlink():
+        path.unlink()
+    path.symlink_to(target)
+
+
+def hook_entry():
+    return {'hooks': [{'type': 'command', 'command':
+            f'python3 {shlex.quote(str(BUNDLE / "hooks/route_prompt.py"))}', 'timeout': 10}]}
+
+
+def hook_config(remove=False):
+    path = USER / '.codex/hooks.json'
+    data = load(path, {})
+    events = data.setdefault('hooks', {}).setdefault('UserPromptSubmit', [])
+    owned = hook_entry()
+    events[:] = [entry for entry in events if entry != owned]
+    if not remove:
+        events.append(owned)
+    return path, data
+
+
+def project_files(project):
+    rule = project / '.cursor/rules/service-os.mdc'
+    agents = project / 'AGENTS.md'
+    text = agents.read_text() if agents.exists() else ''
+    if (text.count(BEGIN) != text.count(END) or text.count(BEGIN) > 1
+            or (BEGIN in text and text.index(END) < text.index(BEGIN))):
+        raise ValueError(f'Malformed managed block: {agents}')
+    if rule.exists() or rule.is_symlink():
+        if rule.is_symlink() or not rule.read_text().startswith('---\n# Managed by service-os-skills\n'):
+            raise ValueError(f'Refusing unrelated Cursor rule: {rule}')
+    return rule, agents, text
+
+
+def without_block(text):
+    if BEGIN in text:
+        start, rest = text.split(BEGIN, 1)
+        _, tail = rest.split(END, 1)
+        return start + tail.lstrip('\n')
+    return text
+
+
+def configure_project(project):
+    rule, agents, text = project_files(project)
+    if BEGIN in text:
+        before, rest = text.split(BEGIN, 1)
+        _, after = rest.split(END, 1)
+        text = before + BEGIN + '\n' + routes() + '\n' + END + after
+    else:
+        text += ('\n\n' if text and not text.endswith('\n\n') else '') + BEGIN + '\n' + routes() + '\n' + END + '\n'
+    agents.write_text(text)
+    rule.parent.mkdir(parents=True, exist_ok=True)
+    rule.write_text('---\n# Managed by service-os-skills\ndescription: Required Service OS routing\nalwaysApply: true\n---\n' + routes() + '\n')
+
+
+def validate(source):
+    print(run(sys.executable, str(source / 'scripts/validate.py'), cwd=source))
+
+
+def install(source, project, state=None):
+    validate(source)
+    state = state or load(STATE, {'projects': [], 'remote': REMOTE})
+    if project is not None:
+        project = project.resolve()
+        if not project.is_dir():
+            raise ValueError(f'Project does not exist: {project}')
+        project_files(project)
+    for path, target in links().items():
+        check_link(path, target)
+    config_path, config = hook_config()
+    if BUNDLE.exists() and not (BUNDLE / '.service-os-managed').exists():
+        raise ValueError(f'Refusing unmanaged installation: {BUNDLE}')
+    # Prepare and validate before replacing the stable installation. No source .git is copied.
+    BASE.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='stage-', dir=BASE) as temp:
+        staged = Path(temp) / 'bundle'
+        staged.mkdir()
+        for name in ('skills', 'scripts', 'hooks', 'docs', 'tests', 'service-os-skills', 'README.md', 'VERSION'):
+            origin = source / name
+            if origin.is_dir():
+                shutil.copytree(origin, staged / name, ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
+            else:
+                shutil.copy2(origin, staged / name)
+        try:
+            revision = run('git', 'rev-parse', 'HEAD', cwd=source)
+        except subprocess.CalledProcessError:
+            revision = load(source / '.service-os-managed', {}).get('revision', 'uncommitted')
+        save(staged / '.service-os-managed', {'revision': revision})
+        validate(staged)
+        backup = BASE / 'previous'
+        if backup.exists():
+            raise ValueError(f'Recovery directory exists; inspect before retry: {backup}')
+        if BUNDLE.exists():
+            BUNDLE.rename(backup)
+        try:
+            staged.rename(BUNDLE)
+        except OSError:
+            if backup.exists():
+                backup.rename(BUNDLE)
+            raise
+        if backup.exists():
+            shutil.rmtree(backup)
+    for path, target in links().items():
+        link(path, target)
+    if config_path.exists() and not config_path.with_suffix('.json.service-os-backup').exists():
+        shutil.copy2(config_path, config_path.with_suffix('.json.service-os-backup'))
+    save(config_path, config)
+    if project is not None:
+        configure_project(project)
+        state['projects'] = sorted(set(state['projects'] + [str(project)]))
+    save(STATE, state)
+    print('Installed. Restart clients and complete their normal hook trust prompt. No credentials or dashboard access installed.')
+    print('Codex: $service-os inspect. Cursor: /service-os inspect. Keyword routing is configured for registered workspaces.')
+    print('For Cursor routing in another workspace: service-os-skills install --project /path/to/workspace')
+
+
+def doctor():
+    errors = []
+    if not (BUNDLE / '.service-os-managed').exists():
+        raise ValueError('Not installed. Run install first.')
+    validate(BUNDLE)
+    for path, target in links().items():
+        if not path.is_symlink() or path.resolve() != target.resolve():
+            errors.append(f'Missing/wrong symlink: {path}')
+    config = load(USER / '.codex/hooks.json', {})
+    if hook_entry() not in config.get('hooks', {}).get('UserPromptSubmit', []):
+        errors.append('Codex routing hook missing')
+    state = load(STATE, {'projects': []})
+    for value in state['projects']:
+        project = Path(value)
+        if not project.exists():
+            errors.append(f'Workspace unavailable: {project}')
+            continue
+        rule, agents, text = project_files(project)
+        if routes() not in text or not rule.exists() or routes() not in rule.read_text():
+            errors.append(f'Workspace routing missing: {project}')
+    print('Version:', (BUNDLE / 'VERSION').read_text().strip())
+    print('Revision:', load(BUNDLE / '.service-os-managed', {})['revision'])
+    print('Workspaces:', ', '.join(state['projects']) or 'none (register a Cursor workspace)')
+    print('MANUAL: verify Codex hook trust/enabled status and run docs/pilot-checks.md in both clients.')
+    print('MANUAL: verify Firebase/Coralogix login; CLI does not inspect sessions or claim connectivity.')
+    print('MANUAL: knowledge PR publishing needs an authorized GitHub connector or Git + gh.')
+    for error in errors:
+        print('FAIL:', error)
+    return 1 if errors else 0
+
+
+def uninstall():
+    if not STATE.exists():
+        raise ValueError('No managed installation state found')
+    # Read and validate all config before removing managed content.
+    config_path, config = hook_config(remove=True)
+    state = load(STATE, {})
+    changes = []
+    for value in state.get('projects', []):
+        project = Path(value)
+        if not project.exists():
+            continue
+        changes.append(project_files(project))
+    # Refuse conflicts in any workspace before removing anything in another.
+    for rule, agents, text in changes:
+        if BEGIN in text:
+            agents.write_text(without_block(text))
+        if rule.exists():
+            rule.unlink()
+    save(config_path, config)
+    for path, target in links().items():
+        if path.is_symlink() and path.resolve() == target.resolve():
+            path.unlink()
+    if BUNDLE.exists() and (BUNDLE / '.service-os-managed').exists():
+        shutil.rmtree(BUNDLE)
+    STATE.unlink()
+    print('Removed managed installation/routing; unrelated settings preserved.')
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('command', choices=['install', 'doctor', 'update', 'uninstall', 'where'])
+    parser.add_argument('--project', type=Path, help='Workspace to configure for Codex/Cursor routing (default: current directory on install)')
+    args = parser.parse_args()
+    if args.command == 'install':
+        install(SOURCE, args.project or Path.cwd())
+    elif args.command == 'doctor':
+        return doctor()
+    elif args.command == 'where':
+        print(BUNDLE)
+    elif args.command == 'uninstall':
+        uninstall()
+    elif args.command == 'update':
+        state = load(STATE, None)
+        if state is None:
+            raise ValueError('Install first')
+        with tempfile.TemporaryDirectory(prefix='service-os-update-') as temp:
+            clone = Path(temp) / 'source'
+            run('git', 'clone', '--depth', '1', '--branch', 'main', state['remote'], str(clone))
+            install(clone, None, state)
+        print('Updated from canonical main; restart clients. Project routes still point to the stable bundle.')
+    return 0
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except (ValueError, OSError, subprocess.CalledProcessError) as error:
+        print(f'Error: {error}', file=sys.stderr)
+        sys.exit(1)

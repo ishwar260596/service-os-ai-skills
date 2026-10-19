@@ -1,0 +1,3 @@
+# Maintaining Service OS skills
+
+This repository contains instructions and tooling, not the mobile application. Validate with `python3 scripts/validate.py` and `python3 -m unittest discover -s tests`. Keep production investigation read-only and only FE ID/Job ID mandatory. Uploaded logs are requested only after dashboard investigation is insufficient. Preserve unrelated client configuration. Never commit raw incidents, credentials or personal data. Knowledge-learning PRs are reviewed by @ishwar260596; never auto-merge. Do not claim live-client or production verification when only offline checks ran.
