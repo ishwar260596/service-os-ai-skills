@@ -1,0 +1,6 @@
+interface:
+  display_name: "Service OS"
+  short_description: "Investigate FE tasks using mobile logs and Firebase"
+  default_prompt: "Use $service-os to investigate Service OS with the supplied FE ID and Job ID."
+policy:
+  allow_implicit_invocation: true
